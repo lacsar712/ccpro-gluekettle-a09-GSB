@@ -1,7 +1,7 @@
 from sqlmodel import select
 
 from app.db import get_session
-from app.models import CookLog, Kettle, User, Workshop
+from app.models import CookLog, Kettle, SieveTag, User, Workshop
 from app.security import hash_password
 
 
@@ -39,4 +39,7 @@ def seed_demo() -> None:
             session.flush()
             if peak is not None:
                 session.add(CookLog(kettle_id=kettle.id, peak_temp_c=peak, operator="worker"))
+            if code == "锅-2":
+                # 种子：一口冷锅挂着一张 80 目未作废筛网牌。
+                session.add(SieveTag(kettle_id=kettle.id, mesh=80, hung_by="admin"))
         session.commit()

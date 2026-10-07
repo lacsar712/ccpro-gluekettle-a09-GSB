@@ -1,15 +1,18 @@
+from datetime import datetime, timezone
+
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 from sqlmodel import SQLModel, select
 
 from app.db import engine, get_session
-from app.domain import RuleError, assert_can_set_status, latest_peak
-from app.models import CookLog, Kettle, User, Workshop
+from app.domain import RuleError, assert_can_set_status, latest_peak, latest_sieve_tag
+from app.models import CookLog, Kettle, SieveTag, User, Workshop, utcnow
 from app.security import make_token, parse_token, verify_password
 from app.seed import seed_demo
 
@@ -25,13 +28,22 @@ async def current_user(request: Request) -> User | None:
         return session.exec(select(User).where(User.username == username)).first()
 
 
+def admin_only(user: User) -> JSONResponse | None:
+    if user.role != "admin":
+        return JSONResponse({"detail": "只有管理员能挂牌或作废筛网牌"}, status_code=403)
+    return None
+
+
 def load_kettle(session, kettle_id: int) -> Kettle | None:
     return session.exec(
-        select(Kettle).where(Kettle.id == kettle_id).options(selectinload(Kettle.cooks))
+        select(Kettle)
+        .where(Kettle.id == kettle_id)
+        .options(selectinload(Kettle.cooks), selectinload(Kettle.sieve_tags))
     ).first()
 
 
 def kettle_json(kettle: Kettle) -> dict:
+    tag = latest_sieve_tag(kettle)
     return {
         "id": kettle.id,
         "code": kettle.code,
@@ -39,6 +51,19 @@ def kettle_json(kettle: Kettle) -> dict:
         "bench": kettle.bench,
         "latestPeakC": latest_peak(kettle),
         "cookCount": len(kettle.cooks or []),
+        "sieveMesh": tag.mesh if tag else None,
+    }
+
+
+def sieve_tag_json(tag: SieveTag) -> dict:
+    return {
+        "id": tag.id,
+        "kettleId": tag.kettle_id,
+        "kettleCode": tag.kettle.code if tag.kettle else None,
+        "mesh": tag.mesh,
+        "hungAt": tag.hung_at.isoformat() if tag.hung_at else None,
+        "hungBy": tag.hung_by,
+        "voidedAt": tag.voided_at.isoformat() if tag.voided_at else None,
     }
 
 
@@ -75,7 +100,7 @@ async def board(request: Request):
         kettles = session.exec(
             select(Kettle)
             .where(Kettle.workshop_id == shop.id)
-            .options(selectinload(Kettle.cooks))
+            .options(selectinload(Kettle.cooks), selectinload(Kettle.sieve_tags))
         ).all()
         loaded = sorted(kettles, key=lambda k: k.bench)
         return JSONResponse(
@@ -124,6 +149,87 @@ async def set_status(request: Request):
         return JSONResponse(kettle_json(kettle))
 
 
+async def list_sieve_tags(request: Request):
+    user = await current_user(request)
+    if user is None:
+        return JSONResponse({"detail": "未登录"}, status_code=401)
+    kettle_id = request.query_params.get("kettle_id")
+    with get_session() as session:
+        query = (
+            select(SieveTag)
+            .options(selectinload(SieveTag.kettle))
+            .order_by(SieveTag.hung_at.desc(), SieveTag.id.desc())
+        )
+        if kettle_id:
+            query = query.where(SieveTag.kettle_id == int(kettle_id))
+        tags = session.exec(query).all()
+        return JSONResponse({"tags": [sieve_tag_json(t) for t in tags]})
+
+
+async def hang_sieve_tag(request: Request):
+    user = await current_user(request)
+    if user is None:
+        return JSONResponse({"detail": "未登录"}, status_code=401)
+    denied = admin_only(user)
+    if denied is not None:
+        return denied
+    kettle_id = int(request.path_params["kettle_id"])
+    body = await request.json()
+    try:
+        mesh = int(body.get("mesh"))
+        if mesh <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        return JSONResponse({"detail": "目数必须是正整数"}, status_code=400)
+    hung_at = None
+    raw_hung = str(body.get("hungAt") or "").strip()
+    if raw_hung:
+        try:
+            hung_at = datetime.fromisoformat(raw_hung)
+        except ValueError:
+            return JSONResponse({"detail": "挂出时刻格式不对"}, status_code=400)
+        if hung_at.tzinfo is None:
+            hung_at = hung_at.replace(tzinfo=timezone.utc)
+    with get_session() as session:
+        kettle = session.get(Kettle, kettle_id)
+        if kettle is None:
+            return JSONResponse({"detail": "锅不存在"}, status_code=404)
+        tag = SieveTag(kettle_id=kettle.id, mesh=mesh, hung_by=user.username)
+        if hung_at is not None:
+            tag.hung_at = hung_at
+        session.add(tag)
+        try:
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            return JSONResponse(
+                {"detail": "同一挂出时刻该锅已有未作废筛网牌，只许入库一张"}, status_code=409
+            )
+        session.refresh(tag)
+        return JSONResponse(sieve_tag_json(tag), status_code=201)
+
+
+async def void_sieve_tag(request: Request):
+    user = await current_user(request)
+    if user is None:
+        return JSONResponse({"detail": "未登录"}, status_code=401)
+    denied = admin_only(user)
+    if denied is not None:
+        return denied
+    tag_id = int(request.path_params["tag_id"])
+    with get_session() as session:
+        tag = session.get(SieveTag, tag_id)
+        if tag is None:
+            return JSONResponse({"detail": "筛网牌不存在"}, status_code=404)
+        if tag.voided_at is not None:
+            return JSONResponse({"detail": "该筛网牌已作废"}, status_code=400)
+        tag.voided_at = utcnow()
+        session.add(tag)
+        session.commit()
+        session.refresh(tag)
+        return JSONResponse(sieve_tag_json(tag))
+
+
 def init() -> None:
     SQLModel.metadata.create_all(engine)
     seed_demo()
@@ -139,6 +245,9 @@ app = Starlette(
         Route("/api/board", board),
         Route("/api/kettles/{kettle_id:int}/cooks", add_cook, methods=["POST"]),
         Route("/api/kettles/{kettle_id:int}/status", set_status, methods=["POST"]),
+        Route("/api/sieve-tags", list_sieve_tags),
+        Route("/api/kettles/{kettle_id:int}/sieve-tags", hang_sieve_tag, methods=["POST"]),
+        Route("/api/sieve-tags/{tag_id:int}/void", void_sieve_tag, methods=["POST"]),
     ],
     middleware=[Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])],
 )
