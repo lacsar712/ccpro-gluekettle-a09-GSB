@@ -8,6 +8,11 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def utcnow_second() -> datetime:
+    # 挂出时刻精确到秒：同秒抢交即视为同一挂出时刻
+    return datetime.now(timezone.utc).replace(microsecond=0)
+
+
 class User(SQLModel, table=True):
     __tablename__ = "users"
 
@@ -36,6 +41,7 @@ class Kettle(SQLModel, table=True):
     bench: int = 0
     workshop: Optional[Workshop] = Relationship(back_populates="kettles")
     cooks: list["CookLog"] = Relationship(back_populates="kettle")
+    screen_tags: list["ScreenTag"] = Relationship(back_populates="kettle")
 
 
 class CookLog(SQLModel, table=True):
@@ -45,3 +51,18 @@ class CookLog(SQLModel, table=True):
     peak_temp_c: float
     operator: str = ""
     kettle: Optional[Kettle] = Relationship(back_populates="cooks")
+
+
+class ScreenTag(SQLModel, table=True):
+    """筛网牌：一口锅挂一张，挂出时刻 + 目数；作废后作废时刻非空。"""
+
+    __tablename__ = "screentags"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    kettle_id: int = Field(foreign_key="kettle.id", index=True)
+    mesh: int
+    posted_at: datetime = Field(default_factory=utcnow_second, index=True)
+    posted_by: str = ""
+    revoked_at: Optional[datetime] = Field(default=None, index=True)
+    revoked_by: str = ""
+    kettle: Optional[Kettle] = Relationship(back_populates="screen_tags")

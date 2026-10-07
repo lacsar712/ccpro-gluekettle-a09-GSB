@@ -1,8 +1,9 @@
 from sqlmodel import select
 
 from app.db import get_session
-from app.models import CookLog, Kettle, User, Workshop
+from app.models import CookLog, Kettle, ScreenTag, User, Workshop, utcnow_second
 from app.security import hash_password
+from datetime import timedelta
 
 
 def seed_demo() -> None:
@@ -20,6 +21,7 @@ def seed_demo() -> None:
             worker.password_hash = hash_password("123456")
             worker.role = "worker"
         if session.exec(select(Workshop)).first():
+            _seed_demo_screen(session)
             session.commit()
             return
         shop = Workshop(name="骨巷熬胶坊", alley="西市骨巷")
@@ -39,4 +41,30 @@ def seed_demo() -> None:
             session.flush()
             if peak is not None:
                 session.add(CookLog(kettle_id=kettle.id, peak_temp_c=peak, operator="worker"))
+        session.flush()
+        _seed_demo_screen(session)
         session.commit()
+
+
+def _seed_demo_screen(session) -> None:
+    """冷锅锅-2 挂着一张 80 目未作废牌：演示改熬煮中被中文挡住。"""
+
+    pot2 = session.exec(select(Kettle).where(Kettle.code == "锅-2")).first()
+    if pot2 is None:
+        return
+    exists = session.exec(
+        select(ScreenTag).where(
+            ScreenTag.kettle_id == pot2.id,
+            ScreenTag.revoked_at.is_(None),
+        )
+    ).first()
+    if exists is None:
+        session.add(
+            ScreenTag(
+                kettle_id=pot2.id,
+                mesh=80,
+                posted_by="admin",
+                posted_at=utcnow_second() - timedelta(minutes=2),
+            )
+        )
+        session.flush()
